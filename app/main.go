@@ -17,7 +17,7 @@ var PROTOCOL = "tcp"
 
 var PONG_RESPONSE = []byte("+PONG\r\n")
 var PING_COMMAND = []byte("PING")
-var UNKNOWN_COMMAND_RESPONSE = []byte("UNKNOWN COMMAND RECIEVED.\n")
+var UNKNOWN_COMMAND_RESPONSE = []byte("UNKNOWN COMMAND RECIEVED")
 
 func main() {
 	fmt.Println("Logs from your program will appear here!")
@@ -72,6 +72,6 @@ func handleRequest(cmd []byte) []byte {
 	if bytes.Equal(cmd, PING_COMMAND) {
 		return PONG_RESPONSE
 	} else {
-		return UNKNOWN_COMMAND_RESPONSE
+		return bytes.Join([][]byte{UNKNOWN_COMMAND_RESPONSE, []byte(": "), cmd, []byte("\n")}, []byte(""))
 	}
 }
