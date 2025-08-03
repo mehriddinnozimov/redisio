@@ -42,21 +42,23 @@ func main() {
 	}
 }
 
-var DELIMEITER_NEW_LINE byte = '\n'
-
 func handleClient(conn net.Conn) error {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
 
 	for {
-		line, err := reader.ReadBytes(DELIMEITER_NEW_LINE)
+		line, err := readCRLFLine(reader)
 		if err != nil {
 			if err != io.EOF {
 				return nil
 			} else {
 				return err
 			}
+		}
+
+		if line[0] == byte('*') || line[0] == byte('$') {
+			continue
 		}
 
 		cleaned := bytes.TrimSpace(line)
@@ -67,9 +69,22 @@ func handleClient(conn net.Conn) error {
 	}
 }
 
+func readCRLFLine(reader *bufio.Reader) ([]byte, error) {
+	line, err := reader.ReadSlice('\n')
+	if err != nil {
+		return nil, err
+	}
+
+	if !bytes.HasSuffix(line, []byte("\r\n")) {
+		return nil, fmt.Errorf("line does not end with CRLF: %q", line)
+	}
+
+	return bytes.TrimSuffix(line, []byte("\r\n")), nil
+}
+
 func handleRequest(cmd []byte) []byte {
 	fmt.Printf("Request: %s\n", cmd)
-	if bytes.Equal(cmd, PING_COMMAND) {
+	if bytes.Equal(cmd, PING_COMMAND) || len(cmd) == 0 {
 		return PONG_RESPONSE
 	} else {
 		return bytes.Join([][]byte{UNKNOWN_COMMAND_RESPONSE, []byte(": "), cmd, []byte("\n")}, []byte(""))
