@@ -2,190 +2,257 @@ package eventloop
 
 import (
 	"errors"
-	"math"
-	"math/rand/v2"
-	"net"
-	"runtime"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
-type EL struct {
-	fd      int
-	onData  CB
-	OnError CBErr
-	network string
-	queue   []Conn
+type EventLoop struct {
+	fd           int
+	onData       CB
+	onError      CBErr
+	network      string
+	conns        map[int32]*Conn
+	maxEvents    int
+	maxByte      int
+	lastConnId   int
+	epoolTimeout int
+	removed      int
+	closedByConn int
+	isClosed     int32
+	added        int
+	wakeFd       int
+	pendingOps   []pendingOp
+	mu           sync.Mutex
 }
 
-type Conn struct {
-	raw syscall.RawConn
-	fd  uintptr
-}
-
-type LoadBalanceType int
+type operationType int
 
 const (
-	Random LoadBalanceType = iota
-	RoundRobin
-	LeastConnections
+	opAdd operationType = iota
+	opRemove
 )
 
-type ELManager struct {
-	eventLoops      []*EL
-	onData          CB
-	OnError         CBErr
-	loadBalanceType LoadBalanceType
-	lastUsedIndex   int
-	listener        net.Listener
-}
-type Write func(out []byte)
-type CB func(err error, in []byte, write Write)
-type CBErr func(err error, in []byte)
-
-type ElManagerOption struct {
-	LoopCount   int
-	OnError     CBErr
-	OnData      CB
-	LoadBalance LoadBalanceType
+type pendingOp struct {
+	typ  operationType
+	conn *Conn
 }
 
-func NewELManager(option ElManagerOption) (*ELManager, error) {
-	if option.LoopCount <= 1 {
-		if option.LoopCount == 0 {
-			option.LoopCount = runtime.NumCPU()
-		} else {
-			return nil, errors.New("LoopCount should be greater or eqeal than 0 (0 - cpu count)")
+func newEventLoop(cb CB, onError CBErr, maxEvents int, maxByte int, network string, epoolTimeout int) (*EventLoop, error) {
+	if maxEvents < 1 {
+		maxEvents = MAX_EVENTS
+	}
+
+	if maxByte < 1 {
+		maxByte = MAX_BYTE
+	}
+
+	if epoolTimeout == 0 || epoolTimeout < -1 {
+		epoolTimeout = EPOOL_TIMEOUT
+	}
+
+	epfd, err := unix.EpollCreate1(0)
+	if err != nil {
+		return nil, err
+	}
+
+	wakeFd, err := unix.Eventfd(0, unix.EFD_NONBLOCK)
+	if err != nil {
+		return nil, err
+	}
+
+	wakeEvent := &unix.EpollEvent{
+		Events: syscall.EPOLLIN,
+		Fd:     int32(wakeFd),
+	}
+	if err := unix.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, wakeFd, wakeEvent); err != nil {
+		return nil, err
+	}
+
+	el := &EventLoop{fd: epfd, onData: cb, wakeFd: wakeFd, onError: onError, maxEvents: maxEvents, maxByte: maxByte, network: network, conns: make(map[int32]*Conn), pendingOps: []pendingOp{}, epoolTimeout: epoolTimeout}
+
+	go el.loop()
+
+	return el, nil
+}
+
+func (el *EventLoop) close() error {
+	el.isClosed = 1
+	errs := []error{}
+	for _, conn := range el.conns {
+		err := el.remove(conn)
+		if err != nil && el.onError != nil {
+			errs = append(errs, err)
 		}
 	}
-	elManager := &ELManager{onData: option.OnData, loadBalanceType: option.LoadBalance, lastUsedIndex: -1, OnError: option.OnError}
-	for _ = range option.LoopCount {
-		el, err := newEL(option.OnData)
-		if err != nil {
-			elManager.OnError(err, nil)
+
+	if len(errs) > 0 && el.onError != nil {
+		for _, err := range errs {
+			el.onError(err, nil)
+		}
+	}
+
+	return unix.Close(el.fd)
+}
+
+func (el *EventLoop) handleReadEvent(conn *Conn) {
+	for {
+		if atomic.LoadInt32(&conn.closed) == 1 {
+			return
+		}
+		n, err := unix.Read(conn.fd, conn.buf)
+		if n == 0 {
+			el.remove(conn)
 			break
 		}
-		elManager.eventLoops = append(elManager.eventLoops, el)
+		if err != nil {
+			if err == unix.EAGAIN || err == unix.EBADF {
+				break
+			}
+
+			if el.onError != nil {
+				el.onError(err, conn.buf)
+			}
+			break
+		}
+
+		conn.lastReadTime = time.Now()
+
+		if el.onData != nil {
+			el.onData(conn.buf[:n], conn)
+		}
 	}
-	return elManager, nil
 }
 
-func newEL(cb CB) (*EL, error) {
-	epfd, err := syscall.EpollCreate1(0)
-	return &EL{fd: epfd, onData: cb}, err
-}
-
-func (elManager *ELManager) Listen(network string, address string) error {
-	l, err := net.Listen(network, address)
-	if err != nil {
-		return err
-	}
-
-	elManager.listener = l
-
-	go elManager.acceptConn()
-
-	return nil
-}
-
-func (elManager *ELManager) acceptConn() {
+func (el *EventLoop) loop() {
+	events := make([]unix.EpollEvent, el.maxEvents)
 	for {
-		conn, err := elManager.listener.Accept()
-		if err != nil {
-			elManager.onData(err, nil, nil)
-			continue
-		} else {
-			go elManager.handleConn(conn)
+		if atomic.LoadInt32(&el.isClosed) == 1 {
+			fmt.Printf("Loop (%d) is closed, breaking\n", el.fd)
+			break
 		}
-	}
-}
-
-func (elManager *ELManager) handleConn(conn net.Conn) {
-	el := elManager.pick()
-	el.Add(conn)
-}
-
-func (elManager *ELManager) pick() *EL {
-	var index int
-
-	switch elManager.loadBalanceType {
-	case Random:
-		index = rand.IntN(len(elManager.eventLoops))
-	case LeastConnections:
-		var min = math.MaxInt
-		for elInd, el := range elManager.eventLoops {
-			if len(el.queue) < min {
-				min = len(el.queue)
-				index = elInd
+		n, err := unix.EpollWait(el.fd, events, el.epoolTimeout)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			if el.onError != nil {
+				el.onError(err, nil)
 			}
 		}
-	case RoundRobin:
-		elManager.lastUsedIndex = elManager.lastUsedIndex + 1
-		if elManager.lastUsedIndex >= len(elManager.eventLoops) {
-			elManager.lastUsedIndex = 0
-		}
-		index = elManager.lastUsedIndex
-	}
 
-	return elManager.eventLoops[index]
+		shouldRemove := []*Conn{}
+		readyConns := make([]*Conn, 0, n)
+		for i := 0; i < n; i++ {
+			fd := events[i].Fd
+
+			if int(fd) == el.wakeFd {
+				var buf [8]byte
+				unix.Read(el.wakeFd, buf[:])
+
+				pendingOps := el.pendingOps
+				el.mu.Lock()
+				el.pendingOps = nil
+				el.mu.Unlock()
+				for _, pendingOp := range pendingOps {
+					switch pendingOp.typ {
+					case opAdd:
+						el.add(pendingOp.conn)
+					case opRemove:
+						el.closedByConn++
+						el.remove(pendingOp.conn)
+					}
+				}
+
+				el.pendingOps = el.pendingOps[:0]
+
+				continue
+			}
+
+			if conn, ok := el.conns[fd]; ok {
+				if events[i].Events&(unix.EPOLLHUP|unix.EPOLLRDHUP|unix.EPOLLERR) != 0 {
+					shouldRemove = append(shouldRemove, conn)
+					continue
+				}
+
+				readyConns = append(readyConns, conn)
+			}
+		}
+
+		for _, conn := range readyConns {
+			el.handleReadEvent(conn)
+		}
+
+		for _, conn := range shouldRemove {
+			if el.onError != nil {
+				el.onError(errors.New("connection closed"), nil)
+			}
+			el.remove(conn)
+		}
+	}
 }
 
-func (el *EL) loop() {
-	for _, conn := range el.queue {
-		el.onData(nil, nil, func(out []byte) {
-			syscall.Write(int(conn.fd), out)
-		})
+func (el *EventLoop) remove(conn *Conn) error {
+	if conn == nil {
+		return errors.New("nil connection")
 	}
+
+	if !atomic.CompareAndSwapInt32(&conn.closed, 0, 1) {
+		return nil
+	}
+
+	el.removed = el.removed + 1
+	delete(el.conns, int32(conn.fd))
+
+	err := unix.EpollCtl(el.fd, unix.EPOLL_CTL_DEL, conn.fd, nil)
+	if err != nil && el.onError != nil {
+		el.onError(fmt.Errorf("epoll ctl del error: %w", err), nil)
+	}
+
+	err = unix.Close(conn.fd)
+
+	return err
 }
 
-func (el *EL) Add(newConn net.Conn) {
-	var rawConn syscall.RawConn
-	var err error
-	if el.network == "tcp" {
-		tcpConn, ok := newConn.(*net.TCPConn)
-		if !ok {
-			if el.OnError != nil {
-				el.OnError(errors.New("not a tcp connection"), nil)
-			}
-			newConn.Close()
-			return
-		}
-
-		rawConn, err = tcpConn.SyscallConn()
-		if err != nil {
-			if el.OnError != nil {
-				el.OnError(err, nil)
-			}
-			newConn.Close()
-			return
-		}
-	}
-
-	conn := Conn{raw: rawConn}
-	rawConn.Control(func(f uintptr) {
-		conn.fd = f
-		err := syscall.SetNonblock(int(conn.fd), true)
-		if err != nil {
-			el.OnError(err, nil)
-		}
-	})
+func (el *EventLoop) add(conn *Conn) {
 
 	event := &syscall.EpollEvent{
-		Events: syscall.EPOLLIN | syscall.EPOLLOUT,
+		Events: syscall.EPOLLIN | syscall.EPOLLRDHUP | syscall.EPOLLHUP | syscall.EPOLLERR,
 		Fd:     int32(conn.fd),
 	}
 
-	err = syscall.EpollCtl(el.fd, syscall.EPOLL_CTL_ADD, int(conn.fd), event)
+	err := syscall.EpollCtl(el.fd, syscall.EPOLL_CTL_ADD, conn.fd, event)
 	if err != nil {
-		el.OnError(err, nil)
+
+		if el.onError != nil {
+			el.onError(err, nil)
+		}
+		syscall.Close(conn.fd)
 		return
 	}
 
-	el.queue = append(el.queue, conn)
-	el.continueLoop()
+	id := el.lastConnId + 1
+	el.lastConnId = id
+	el.added++
+
+	conn.ID = id
+
+	el.conns[int32(conn.fd)] = conn
 }
 
-func (el *EL) continueLoop() {
-	if len(el.queue) > 0 {
-		go el.loop()
-	}
+func (el *EventLoop) pushOp(pendingOp pendingOp) {
+	el.mu.Lock()
+	el.pendingOps = append(el.pendingOps, pendingOp)
+	el.mu.Unlock()
+	var one uint64 = 1
+	unix.Write(el.wakeFd, (*(*[8]byte)(unsafe.Pointer(&one)))[:])
+}
+
+func (el *EventLoop) connCount() int {
+	return len(el.conns)
 }
